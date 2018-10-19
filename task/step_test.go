@@ -2,7 +2,6 @@ package task
 
 import (
 	"container/list"
-	"context"
 	"errors"
 	"log"
 	"testing"
@@ -11,63 +10,60 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func exec1(ctx context.Context, cancelFunc context.CancelFunc, request interface{}, response interface{}) {
+func exec1(request interface{}) (interface{}, error) {
 	log.Println("executing 1")
 	time.Sleep(1000 * time.Millisecond)
-	list := response.(*list.List)
+	list := request.(*list.List)
 	list.PushBack(1)
+	return list, nil
 }
 
-func exec2(ctx context.Context, cancelFunc context.CancelFunc, request interface{}, response interface{}) {
+func exec2(request interface{}) (interface{}, error) {
 	log.Println("executing 2")
 	time.Sleep(1000 * time.Millisecond)
-	list := response.(*list.List)
+	list := request.(*list.List)
 	list.PushBack(2)
+	return list, nil
 }
 
-func exec3(ctx context.Context, cancelFunc context.CancelFunc, request interface{}, response interface{}) {
+func exec3(request interface{}) (interface{}, error) {
 	log.Println("executing 3")
 	time.Sleep(1000 * time.Millisecond)
-	list := response.(*list.List)
+	list := request.(*list.List)
 	list.PushBack(3)
+	return list, nil
 }
 
-func exec4(ctx context.Context, cancelFunc context.CancelFunc, request interface{}, response interface{}) {
+func exec4(request interface{}) (interface{}, error) {
 	log.Println("executing 4")
 	time.Sleep(1000 * time.Millisecond)
-	list := response.(*list.List)
+	list := request.(*list.List)
 	list.PushBack(4)
+	return list, nil
 }
 
-func exec2WithError(ctx context.Context, cancelFunc context.CancelFunc, request interface{}, response interface{}) {
+func exec2WithError(request interface{}) (interface{}, error) {
 	log.Println("executing 2")
 	time.Sleep(1000 * time.Millisecond)
-	status := ctx.Value(StatusKey).(*ExecutionStatus)
-	status.Err = errors.New("err")
-	cancelFunc()
+	return nil, errors.New("err2")
 }
 
-func exec3WithError(ctx context.Context, cancelFunc context.CancelFunc, request interface{}, response interface{}) {
+func exec3WithError(request interface{}) (interface{}, error) {
 	log.Println("executing 3")
 	time.Sleep(1000 * time.Millisecond)
-	status := ctx.Value(StatusKey).(*ExecutionStatus)
-	status.Err = errors.New("err")
-	cancelFunc()
+	return nil, errors.New("err3")
 }
 
 func TestSerial(t *testing.T) {
 
-	ctx := context.WithValue(context.Background(), StatusKey, &ExecutionStatus{})
-	testStatus := ctx.Value(StatusKey).(*ExecutionStatus)
-	log.Println("error: ", testStatus.Err)
 	l := list.New()
-	step := NewSerializedStep(ctx, []ExecutionFunc{exec1, exec2, exec3, exec4}, nil, l)
-	step.Execute()
+	task := NewSimpleSerializedTask([]ExecutionFunc{exec1, exec2, exec3, exec4})
+	result, err := task.Execute(l)
 
-	assert.Equal(t, nil, ctx.Err())
+	assert.Nil(t, err)
 	var first, second *list.Element
 	count := 0
-	for e := l.Front(); e != nil; e = e.Next() {
+	for e := result.(*list.List).Front(); e != nil; e = e.Next() {
 		first = second
 		second = e
 		count = count + 1
@@ -78,67 +74,43 @@ func TestSerial(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 4, count)
-	status := step.Status()
-	assert.Equal(t, nil, status.Err)
 }
 
 func TestSerialWithError(t *testing.T) {
 
-	ctx := context.WithValue(context.Background(), StatusKey, &ExecutionStatus{})
 	l := list.New()
-	step := NewSerializedStep(ctx, []ExecutionFunc{exec1, exec2WithError, exec3, exec4}, nil, l)
-	step.Execute()
+	task := NewSimpleSerializedTask([]ExecutionFunc{exec1, exec2WithError, exec3, exec4})
+	result, err := task.Execute(l)
 
-	assert.Equal(t, nil, ctx.Err())
-	var first, second *list.Element
-	count := 0
-	for e := l.Front(); e != nil; e = e.Next() {
-		first = second
-		second = e
-		count++
-
-		log.Println("value: ", e.Value)
-		if first != nil && second != nil {
-			assert.True(t, first.Value.(int) < second.Value.(int))
-		}
-	}
-	assert.Equal(t, 1, count)
-	status := step.Status()
-	assert.NotEqual(t, nil, status)
+	assert.NotNil(t, err)
+	assert.Nil(t, result)
 }
 
 func TestParallel(t *testing.T) {
 
-	ctx := context.WithValue(context.Background(), StatusKey, &ExecutionStatus{})
 	l := list.New()
-	step := NewParallelStep(ctx, []ExecutionFunc{exec1, exec2, exec3, exec4}, nil, l)
-	step.Execute()
+	task := NewSimpleParallelTask([]ExecutionFunc{exec1, exec2, exec3, exec4}, func(results []interface{}) (interface{}, error) {
+		return results[0], nil
+	})
+	result, err := task.Execute(l)
 
-	assert.Equal(t, nil, ctx.Err())
+	assert.Nil(t, err)
 	count := 0
-	for e := l.Front(); e != nil; e = e.Next() {
+	for e := result.(*list.List).Front(); e != nil; e = e.Next() {
 		count++
 		log.Println("value: ", e.Value)
 	}
 	assert.Equal(t, 4, count)
-	status := step.Status()
-	assert.Equal(t, nil, status.Err)
 }
 
 func TestParalleleWithError(t *testing.T) {
 
-	ctx := context.WithValue(context.Background(), StatusKey, &ExecutionStatus{})
 	l := list.New()
-	step := NewParallelStep(ctx, []ExecutionFunc{exec1, exec2WithError, exec3WithError, exec4}, nil, l)
-	step.Execute()
+	task := NewSimpleParallelTask([]ExecutionFunc{exec1, exec2WithError, exec3WithError, exec4}, func(results []interface{}) (interface{}, error) {
+		return results[0], nil
+	})
+	result, err := task.Execute(l)
 
-	assert.Equal(t, nil, ctx.Err())
-	count := 0
-	for e := l.Front(); e != nil; e = e.Next() {
-		count++
-
-		log.Println("value: ", e.Value)
-	}
-	assert.Equal(t, 2, count)
-	assert.NotEqual(t, nil, step.Status().Err)
+	assert.NotNil(t, err)
+	assert.Nil(t, result)
 }

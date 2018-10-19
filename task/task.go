@@ -3,15 +3,21 @@ package task
 import (
 	"log"
 	"sync"
+
+	"github.com/google/uuid"
 )
 
-type Task interface {
-	Execute(request interface{}) (interface{}, error)
-}
-
+/*
+ExecutionError thrown when trying to execute a non-root task.
+*/
 type ExecutionError struct {
 }
 
+/*
+NoPostProcessorError thrown when a task has more than 1 sub-tasks, but isn't
+configured with a post processor to merge responses from sub-tasks into
+a single response
+*/
 type NoPostProcessorError struct {
 }
 
@@ -23,30 +29,31 @@ func (e ExecutionError) Error() string {
 	return "cannot execute non-root tasks"
 }
 
-type ProcessorFunc func(request interface{}) (interface{}, error)
-
-type PostProcessorFunc func(responses []interface{}) (interface{}, error)
-
 type tuple struct {
 	value interface{}
 	err   error
 }
 
 type multiStageTask struct {
+	Name          string
 	parentSteps   []*multiStageTask
 	childSteps    []*multiStageTask
-	processor     ProcessorFunc
-	postProcessor PostProcessorFunc
+	processor     ExecutionFunc
+	postProcessor MergeFunc
 	done          chan error
 }
 
-func NewTask(processor ProcessorFunc, postProcessor PostProcessorFunc) *multiStageTask {
+/*
+NewTask creates a new task wil processor and possibly post-processor
+*/
+func NewTask(processor ExecutionFunc, postProcessor MergeFunc) *multiStageTask {
 	return &multiStageTask{
 		parentSteps:   nil,
 		childSteps:    nil,
 		processor:     processor,
 		postProcessor: postProcessor,
 		done:          make(chan error),
+		Name:          uuid.New().String(),
 	}
 }
 
@@ -62,28 +69,9 @@ func containsTask(s []*multiStageTask, e *multiStageTask) bool {
 	return false
 }
 
-func (current *multiStageTask) AddParent(parents ...*multiStageTask) {
-	for _, parent := range parents {
-		if parent == nil {
-			continue
-		}
-		if !containsTask(current.parentSteps, parent) {
-			if current.parentSteps == nil {
-				current.parentSteps = make([]*multiStageTask, 0)
-			}
-			current.parentSteps = append(current.parentSteps, parent)
-		}
-
-		if !containsTask(parent.childSteps, current) {
-			if parent.childSteps == nil {
-				parent.childSteps = make([]*multiStageTask, 0)
-			}
-			parent.childSteps = append(parent.childSteps, current)
-		}
-	}
-	current.printChildren()
-}
-
+/*
+AddChild adds a sub-task to a parent
+*/
 func (current *multiStageTask) AddChild(children ...*multiStageTask) {
 	for _, child := range children {
 		if child == nil {
@@ -103,16 +91,6 @@ func (current *multiStageTask) AddChild(children ...*multiStageTask) {
 			child.parentSteps = append(child.parentSteps, current)
 		}
 	}
-	current.printChildren()
-}
-
-func (current *multiStageTask) printChildren() {
-	log.Println("children is: ", current.childSteps)
-	if current.childSteps != nil {
-		for _, child := range current.childSteps {
-			log.Println("child is: ", child)
-		}
-	}
 }
 
 /*
@@ -123,19 +101,17 @@ func (current multiStageTask) IsRoot() bool {
 	return current.parentSteps == nil || len(current.parentSteps) == 0
 }
 
+/*
+HasChildren returns true if this task has child task(s)
+*/
 func (current multiStageTask) HasChildren() bool {
 	return current.childSteps != nil && len(current.childSteps) > 0
 }
 
-func (current *multiStageTask) Execute(request interface{}) (interface{}, error) {
-
-	if current.IsRoot() {
-		return current.execute(request)
-	}
-	return nil, ExecutionError{}
-}
-
-func (current *multiStageTask) execute(request interface{}) (interface{}, error) {
+/*
+executeSelf executes a task asynchronously without invoking its children if any
+*/
+func (current *multiStageTask) executeSelf(request interface{}) (interface{}, error) {
 
 	// if this task has multiple child tasks (more than 1), but don't have
 	// a postProcessor to merge the results, panic
@@ -144,69 +120,92 @@ func (current *multiStageTask) execute(request interface{}) (interface{}, error)
 	}
 
 	// execute self
-	var selfResponse = request
+	var response = request
 	var err error
 
 	if current.processor != nil {
-		c := make(chan tuple)
+		out := make(chan tuple)
 		go func() {
-			defer close(c)
+			defer close(out)
 			response, err := current.processor(request)
-			c <- tuple{value: response, err: err}
+			out <- tuple{value: response, err: err}
 		}()
 		select {
-		case t := <-c:
-			selfResponse = t.value
+		case t := <-out:
+			response = t.value
 			err = t.err
-			log.Println("execute response is: ", selfResponse)
-			log.Println("execute error is: ", err)
 		}
 	}
+	return response, err
+}
+
+/*
+Execute synchronous form to execute a parent task and get results
+*/
+func (current *multiStageTask) Execute(request interface{}) (interface{}, error) {
+	return current.execute(request)
+}
+
+func (current *multiStageTask) hasMoreThanOneChild() bool {
+	return current.childSteps != nil && len(current.childSteps) > 1
+}
+
+func (current *multiStageTask) execute(request interface{}) (interface{}, error) {
+
+	response, err := current.executeSelf(request)
+	log.Println("in task: ", current.Name, " executeSelf returned: ", response, " err: ", err)
 
 	// execute children
-	if !current.HasChildren() {
-		log.Println("don't have children")
-		return selfResponse, err
+	if !current.HasChildren() || err != nil {
+		log.Println("task: ", current.Name, " don't have children or error")
+		log.Println("task: ", current.Name, " returning: ", response, " err: ", err)
+		return response, err
 	}
 
-	if err != nil {
-		log.Println("error is not nil")
-		return nil, err
-	}
-
+	log.Println("task: ", current.Name, " has children: ", current.HasChildren())
 	if current.HasChildren() {
-		out := make(chan tuple)
-		var wg sync.WaitGroup
-		log.Println("add ", len(current.childSteps), " to wait group")
-		log.Println("out channel is ", out)
-		wg.Add(len(current.childSteps))
+		log.Println("task: ", current.Name, " has children, now processing")
+		outputs := make([]interface{}, len(current.childSteps))
+		var firstError error
+		for index, child := range current.childSteps {
+			resp, childErr := child.execute(response)
 
-		log.Println("has children size: ", len(current.childSteps))
-		for _, child := range current.childSteps {
-			if child != nil {
-				go func(child *multiStageTask, request interface{}) {
-					log.Println("inside child, out channel is ", out)
-					log.Println("inside child, child: ", child)
-					response, err := child.execute(selfResponse)
-					wg.Done()
-					out <- tuple{value: response, err: err}
-				}(child, selfResponse)
+			if firstError == nil && childErr != nil {
+				firstError = childErr
 			}
+			outputs[index] = resp
 		}
 
-		go func() {
-			wg.Wait()
-			defer close(out)
-		}()
-
-		responses, subTaskError := mergeResultIntoSlice(out)
-		if current.postProcessor == nil && len(responses) == 1 {
-			return responses[0], subTaskError
-		} else {
-			return current.postProcessor(responses)
+		if firstError != nil {
+			return nil, firstError
 		}
+
+		if current.hasMoreThanOneChild() {
+			return current.postProcessor(outputs)
+		}
+		return outputs[0], firstError
 	}
-	return selfResponse, err
+	return response, err
+}
+
+func mergeChan(channels []<-chan tuple) <-chan tuple {
+	out := make(chan tuple)
+
+	for _, c := range channels {
+		go func(c <-chan tuple) {
+			for v := range c {
+				out <- v
+			}
+		}(c)
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(channels))
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
 }
 
 func mergeResultIntoSlice(c chan tuple) ([]interface{}, error) {

@@ -1,7 +1,7 @@
 package task
 
 import (
-	"context"
+	"errors"
 	"sync"
 )
 
@@ -16,130 +16,120 @@ const (
 
 /*
 ExecutionFunc completes an execution step,
-ctx: context to use
-cancelFunc: cancel function to call in case of error
 request: request object
-response: return result of the execution
+produces a response and a possible error
 */
-type ExecutionFunc func(ctx context.Context, cancelFunc context.CancelFunc, request interface{}, response interface{})
+type ExecutionFunc func(request interface{}) (interface{}, error)
 
 /*
-CtxKey key type for context
+MergeFunc merges multiple responses into one and produces a possible error
 */
-type CtxKey string
+type MergeFunc func(responses []interface{}) (interface{}, error)
 
-/*
-StatusKey status key used for context object
-*/
-const StatusKey = CtxKey("status")
+func execute(execFuncs []ExecutionFunc, request interface{}, merger MergeFunc) (interface{}, error) {
+	outputs := make([]tuple, len(execFuncs))
+	var wg sync.WaitGroup
+	wg.Add(len(execFuncs))
+	for idx, function := range execFuncs {
+		go func(function ExecutionFunc, request interface{}, outputs []tuple, index int) {
+			response, err := function(request)
+			outputs[index] = tuple{value: response, err: err}
+			wg.Done()
+		}(function, request, outputs, idx)
+	}
+	wg.Wait()
+
+	responses, err := mergeResults(outputs)
+
+	if err != nil {
+		return nil, err
+	}
+	return merger(responses)
+}
+
+func mergeResults(results []tuple) ([]interface{}, error) {
+	var err error
+	response := make([]interface{}, len(results))
+	for idx, result := range results {
+		response[idx] = result.value
+
+		if err == nil && result.err != nil {
+			err = result.err
+		}
+	}
+	return response, err
+}
 
 /*
 ExecutionStep a step in execution
 */
 type ExecutionStep interface {
-	Execute()
+	Execute(request interface{}) (interface{}, error)
 }
 
-/*
-ExecutionStatus contains error if any for executed steps
-*/
-type ExecutionStatus struct {
-	Err error
-}
-
-type simpleStep struct {
-	context       context.Context
-	cancelFunc    context.CancelFunc
+type simpleTask struct {
 	executions    []ExecutionFunc
+	merger        MergeFunc
 	executionMode int
-	request       interface{}
-	response      interface{}
 }
 
 /*
-NewParalleleStep creates a simple step in execution
-parent: parent context, each step will create a new child context using WithCancel
+NewSimpleParallelTask creates a simple step in execution
 executions: functions to be executed in this ExecutionStep
-request: request object
-response: response object
 */
-func NewParallelStep(parent context.Context, executions []ExecutionFunc, request interface{}, response interface{}) simpleStep {
-	ctx, cancelFunc := context.WithCancel(parent)
-	return simpleStep{
-		context:       ctx,
-		cancelFunc:    cancelFunc,
+func NewSimpleParallelTask(executions []ExecutionFunc, merger MergeFunc) simpleTask {
+	return simpleTask{
 		executions:    executions,
+		merger:        merger,
 		executionMode: PARALLELE,
-		request:       request,
-		response:      response,
 	}
 }
 
 /*
-NewSerializedStep creates a simple step in execution
-parent: parent context, each step will create a new child context using WithCancel
+NewSimpleSerializedTask creates a simple step in execution
 executions: functions to be executed in this ExecutionStep, will be executed in sequence
-request: request object
-response: response object
 */
-func NewSerializedStep(parent context.Context, executions []ExecutionFunc, request interface{}, response interface{}) simpleStep {
-	ctx, cancelFunc := context.WithCancel(parent)
-	return simpleStep{
-		context:       ctx,
-		cancelFunc:    cancelFunc,
+func NewSimpleSerializedTask(executions []ExecutionFunc) simpleTask {
+	return simpleTask{
 		executions:    executions,
 		executionMode: SERIAL,
-		request:       request,
-		response:      response,
 	}
 }
 
-func (step *simpleStep) Execute() {
-	switch step.executionMode {
+func (task *simpleTask) Execute(request interface{}) (interface{}, error) {
+	switch task.executionMode {
 	case SERIAL:
-		step.executeSerial()
+		return task.executeSerial(request)
 	case PARALLELE:
-		step.executeParallel()
+		return task.executeParallel(request)
 	}
+	return nil, errors.New("incorrect execution mode")
 }
 
-func (step simpleStep) Status() *ExecutionStatus {
-	status := step.context.Value(StatusKey)
-	if status != nil {
-		if statusStruct, ok := status.(*ExecutionStatus); ok {
-			return statusStruct
-		}
-		return nil
-	}
-	return nil
-}
-
-func (step *simpleStep) IsHealthy() bool {
-	status := step.Status()
-	if status != nil {
-		return status.Err == nil
-	}
-	return false
-}
-
-func (step *simpleStep) executeSerial() {
-	for _, execFunc := range step.executions {
-		execFunc(step.context, step.cancelFunc, step.request, step.response)
-
-		if !step.IsHealthy() {
-			break
-		}
-	}
-}
-
-func (step *simpleStep) executeParallel() {
-	var wg sync.WaitGroup
-	for _, execFunc := range step.executions {
-		wg.Add(1)
-		go func(function ExecutionFunc) {
-			function(step.context, step.cancelFunc, step.request, step.response)
-			wg.Done()
+func (task *simpleTask) executeSerial(request interface{}) (interface{}, error) {
+	for _, execFunc := range task.executions {
+		c := make(chan tuple)
+		go func(exec ExecutionFunc) {
+			defer close(c)
+			response, err := exec(request)
+			c <- tuple{value: response, err: err}
 		}(execFunc)
+
+		var err error
+		select {
+		case t := <-c:
+			// use response from previous step as request for next step
+			request = t.value
+			err = t.err
+		}
+
+		if err != nil {
+			return nil, err
+		}
 	}
-	wg.Wait()
+	return request, nil
+}
+
+func (task *simpleTask) executeParallel(request interface{}) (interface{}, error) {
+	return execute(task.executions, request, task.merger)
 }
